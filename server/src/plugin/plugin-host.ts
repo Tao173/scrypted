@@ -16,7 +16,7 @@ import child_process from 'child_process';
 import { PluginDebug } from './plugin-debug';
 import readline from 'readline';
 import { Readable, Writable } from 'stream';
-import { ensurePluginVolume, getScryptedVolume } from './plugin-volume';
+import { ensurePluginVolume, getPluginVolume, getScryptedVolume } from './plugin-volume';
 import { getPluginNodePath } from './plugin-npm-dependencies';
 import { ConsoleServer, createConsoleServer } from './plugin-console';
 import { LazyRemote } from './plugin-lazy-remote';
@@ -26,7 +26,9 @@ import mkdirp from 'mkdirp';
 import rimraf from 'rimraf';
 
 export class PluginHost {
-    static sharedWorker: child_process.ChildProcess;
+    static nodeSharedWorker: child_process.ChildProcess;
+    static pythonSharedWorker: child_process.ChildProcess;
+
     worker: child_process.ChildProcess;
     peer: RpcPeer;
     pluginId: string;
@@ -202,6 +204,7 @@ export class PluginHost {
                             ? '/plugin/main.nodejs.js'
                             : `/${this.pluginId}/main.nodejs.js`,
                     unzippedPath: this.unzippedPath,
+                    pluginVolume,
                 };
                 // original implementation sent the zipBuffer, sending the zipFile name now.
                 // can switch back for non-local plugins.
@@ -250,36 +253,99 @@ export class PluginHost {
                 path.join(__dirname, '../../python', 'plugin-remote.py'),
             )
 
-            this.worker = child_process.spawn('python3', args, {
-                // stdin, stdout, stderr, peer in, peer out
-                stdio: ['pipe', 'pipe', 'pipe', 'pipe', 'pipe'],
-                env: Object.assign({
-                    PYTHONPATH: path.join(process.cwd(), 'node_modules/@scrypted/sdk'),
-                }, process.env, env),
-            });
+            const useSharedWorker = process.env.SCRYPTED_SHARED_WORKER &&
+                this.packageJson.scrypted.sharedWorker === true;
+            if (useSharedWorker) {
+                args.push('@scrypted/shared');
 
-            const peerin = this.worker.stdio[3] as Writable;
-            const peerout = this.worker.stdio[4] as Readable;
+                if (!PluginHost.pythonSharedWorker) {
+                    PluginHost.pythonSharedWorker = child_process.spawn('python3', args, {
+                        // stdin, stdout, stderr, peer in, peer out
+                        stdio: ['pipe', 'pipe', 'pipe', 'pipe', 'pipe'],
+                        env: Object.assign({
+                            PYTHONPATH: path.join(process.cwd(), 'node_modules/@scrypted/sdk'),
+                            SCRYPTED_PLUGIN_REMOTE_HOME: getPluginVolume('@scrypted/shared'),
+                        }, process.env),
+                    });
 
-            peerin.on('error', e => connected = false);
-            peerout.on('error', e => connected = false);
+                    PluginHost.pythonSharedWorker.setMaxListeners(100);
+                    PluginHost.pythonSharedWorker.on('close', () => PluginHost.pythonSharedWorker = undefined);
+                    PluginHost.pythonSharedWorker.on('error', () => PluginHost.pythonSharedWorker = undefined);
+                    PluginHost.pythonSharedWorker.on('exit', () => PluginHost.pythonSharedWorker = undefined);
+                    PluginHost.pythonSharedWorker.on('disconnect', () => PluginHost.pythonSharedWorker = undefined);
 
-            this.peer = new RpcPeer('host', this.pluginId, (message, reject) => {
-                if (connected) {
-                    peerin.write(JSON.stringify(message) + '\n', e => e && reject?.(e));
+                    const peerout = PluginHost.pythonSharedWorker.stdio[4] as Readable;
+        
+                    const readInterface = readline.createInterface({
+                        input: peerout,
+                        terminal: false,
+                    });
+                    readInterface.on('line', line => PluginHost.pythonSharedWorker.emit('message', JSON.parse(line)));
                 }
-                else if (reject) {
-                    reject(new Error('peer disconnected'));
-                }
-            });
+                this.worker = PluginHost.pythonSharedWorker;
 
-            const readInterface = readline.createInterface({
-                input: peerout,
-                terminal: false,
-            });
-            readInterface.on('line', line => {
-                this.peer.handleMessage(JSON.parse(line));
-            });
+                const peerin = this.worker.stdio[3] as Writable;
+                const peerout = this.worker.stdio[4] as Readable;
+
+                peerin.write(JSON.stringify({
+                    type: 'start',
+                    pluginId: this.pluginId,
+                }) + '\n');
+
+                this.worker.on('message', (message: any) => {
+                    if (message.pluginId === this.pluginId)
+                        this.peer.handleMessage(message.message)
+                });
+   
+                peerin.on('error', e => connected = false);
+                peerout.on('error', e => connected = false);
+    
+                this.peer = new RpcPeer('host', this.pluginId, (message, reject) => {
+                    if (connected) {
+                        const wrapped = {
+                            type: 'message',
+                            pluginId: this.pluginId,
+                            message: message,
+                        };
+                        peerin.write(JSON.stringify(wrapped) + '\n', e => e && reject?.(e));
+                    }
+                    else if (reject) {
+                        reject(new Error('peer disconnected'));
+                    }
+                });
+            }
+            else {
+                this.worker = child_process.spawn('python3', args, {
+                    // stdin, stdout, stderr, peer in, peer out
+                    stdio: ['pipe', 'pipe', 'pipe', 'pipe', 'pipe'],
+                    env: Object.assign({
+                        PYTHONPATH: path.join(process.cwd(), 'node_modules/@scrypted/sdk'),
+                    }, process.env, env),
+                });
+
+                const peerin = this.worker.stdio[3] as Writable;
+                const peerout = this.worker.stdio[4] as Readable;
+    
+                peerin.on('error', e => connected = false);
+                peerout.on('error', e => connected = false);
+    
+                this.peer = new RpcPeer('host', this.pluginId, (message, reject) => {
+                    if (connected) {
+                        peerin.write(JSON.stringify(message) + '\n', e => e && reject?.(e));
+                    }
+                    else if (reject) {
+                        reject(new Error('peer disconnected'));
+                    }
+                });
+    
+                const readInterface = readline.createInterface({
+                    input: peerout,
+                    terminal: false,
+                });
+                readInterface.on('line', line => {
+                    this.peer.handleMessage(JSON.parse(line));
+                });
+            }
         }
         else {
             const execArgv: string[] = process.execArgv.slice();
@@ -292,29 +358,29 @@ export class PluginHost {
                 this.packageJson.scrypted.realfs !== true &&
                 Object.keys(this.packageJson.optionalDependencies || {}).length === 0;
             if (useSharedWorker) {
-                if (!PluginHost.sharedWorker) {
-                    PluginHost.sharedWorker = child_process.fork(require.main.filename, ['child', '@scrypted/shared'], {
+                if (!PluginHost.nodeSharedWorker) {
+                    PluginHost.nodeSharedWorker = child_process.fork(require.main.filename, ['child', '@scrypted/shared'], {
                         stdio: ['pipe', 'pipe', 'pipe', 'ipc'],
                         env: Object.assign({}, process.env, env),
                         serialization: 'advanced',
                         execArgv,
                     });
-                    PluginHost.sharedWorker.setMaxListeners(100);
-                    PluginHost.sharedWorker.on('close', () => PluginHost.sharedWorker = undefined);
-                    PluginHost.sharedWorker.on('error', () => PluginHost.sharedWorker = undefined);
-                    PluginHost.sharedWorker.on('exit', () => PluginHost.sharedWorker = undefined);
-                    PluginHost.sharedWorker.on('disconnect', () => PluginHost.sharedWorker = undefined);
+                    PluginHost.nodeSharedWorker.setMaxListeners(100);
+                    PluginHost.nodeSharedWorker.on('close', () => PluginHost.nodeSharedWorker = undefined);
+                    PluginHost.nodeSharedWorker.on('error', () => PluginHost.nodeSharedWorker = undefined);
+                    PluginHost.nodeSharedWorker.on('exit', () => PluginHost.nodeSharedWorker = undefined);
+                    PluginHost.nodeSharedWorker.on('disconnect', () => PluginHost.nodeSharedWorker = undefined);
                 }
-                PluginHost.sharedWorker.send({
+                this.worker = PluginHost.nodeSharedWorker;
+                this.worker.send({
                     type: 'start',
                     pluginId: this.pluginId,
                 });
-                this.worker = PluginHost.sharedWorker;
                 this.worker.on('message', (message: any) => {
                     if (message.pluginId === this.pluginId)
                         this.peer.handleMessage(message.message)
                 });
-    
+
                 this.peer = new RpcPeer('host', this.pluginId, (message, reject) => {
                     if (connected) {
                         this.worker.send({
@@ -339,7 +405,7 @@ export class PluginHost {
                     execArgv,
                 });
                 this.worker.on('message', message => this.peer.handleMessage(message as any));
-    
+
                 this.peer = new RpcPeer('host', this.pluginId, (message, reject) => {
                     if (connected) {
                         this.worker.send(message, undefined, e => {

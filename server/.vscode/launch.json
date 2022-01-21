@@ -27,7 +27,8 @@
                 "${workspaceFolder}/**/*.js"
             ],
             "env": {
-                // "SCRYPTED_SHARED_WORKER": "true",
+                "SCRYPTED_SHARED_WORKER": "true",
+                "SCRYPTED_VOLUME": "/home/pi/.scrypted/volume",
                 "DEBUG": "/scrypted/*",
             }
         },

@@ -23,6 +23,10 @@ from os import sys
 import platform
 import shutil
 import gc
+import sys
+import asyncio
+import threading
+import zipimport
 
 class SystemDeviceState(TypedDict):
     lastEventTime: int
@@ -169,12 +173,18 @@ class PluginRemote:
             f.write(zipData)
             f.close()
 
+        print('zip path', zipPath)
+
         zipData = None
 
         zip = zipfile.ZipFile(zipPath)
 
-        plugin_volume = os.environ.get('SCRYPTED_PLUGIN_VOLUME')
+        plugin_volume = options.get('pluginVolume', None)
+        modules_path = os.environ.get('SCRYPTED_PLUGIN_REMOTE_HOME', plugin_volume)
         python_prefix = os.path.join(plugin_volume, 'python-%s-%s' % (platform.system(), platform.machine()))
+        modules_prefix = os.path.join(modules_path, 'python-%s-%s' % (platform.system(), platform.machine()))
+        print('modules_prefix', modules_prefix)
+        print('python_prefix', python_prefix)
         if not os.path.exists(python_prefix):
             os.makedirs(python_prefix)
 
@@ -206,7 +216,7 @@ class PluginRemote:
                 f.close()
 
                 p = subprocess.Popen([python, '-m', 'pip', 'install', '-r', requirementstxt,
-                                     '--prefix', python_prefix], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                                     '--prefix', modules_prefix], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
                 while True:
                     line = p.stdout.readline()
                     if not line:
@@ -225,17 +235,23 @@ class PluginRemote:
                 print('requirements.txt (up to date)')
                 print(str_requirements)
 
-        sys.path.insert(0, zipPath)
+        # sys.path.insert(0, zipPath)
+        importer = zipimport.zipimporter(zipPath)
         site_packages = os.path.join(
-            python_prefix, 'lib/%s/site-packages' % python)
+            modules_prefix, 'lib/%s/site-packages' % python)
         sys.path.insert(0, site_packages)
-        from scrypted_sdk import sdk_init  # type: ignore
+        package_name: str = packageJson['name']
+        scrypted_sdk = importer.load_module('scrypted_sdk')
+        sdk_init = scrypted_sdk.sdk_init
+        # from scrypted_sdk import sdk_init  # type: ignore
         self.systemManager = SystemManager(self.api, self.systemState)
         self.deviceManager = DeviceManager(self.nativeIds, self.systemManager)
         self.mediaManager = await self.api.getMediaManager()
         sdk_init(zip, self, self.systemManager,
                  self.deviceManager, self.mediaManager)
-        from main import create_scrypted_plugin  # type: ignore
+        # from main import create_scrypted_plugin  # type: ignore
+        main = importer.load_module('main')
+        create_scrypted_plugin = main.create_scrypted_plugin
         return await rpc.maybe_await(create_scrypted_plugin())
 
     async def setSystemState(self, state):
@@ -323,6 +339,69 @@ def main():
     loop.run_until_complete(async_main(loop))
     loop.close()
 
+async def async_shared_main(loop: AbstractEventLoop):
+    peers = {}
+
+    reader = await aiofiles.open(3, mode='r')
+    async for line in reader:
+        try:
+            message = json.loads(line)
+            mt = message.get('type')
+            pluginId = message.get('pluginId')
+            if mt == 'start':
+                def send(message, reject=None):
+                    wrapped = {}
+                    wrapped['pluginId'] = pluginId
+                    wrapped['message'] = message
+                    jsonString = json.dumps(wrapped)
+                    try:
+                        os.write(4, bytes(jsonString + '\n', 'utf8'))
+                    except Exception as e:
+                        if reject:
+                            reject(e)
+
+                peer = rpc.RpcPeer(send)
+                peer.nameDeserializerMap['Buffer'] = BufferSerializer()
+                peer.constructorSerializerMap[bytes] = 'Buffer'
+                peer.constructorSerializerMap[bytearray] = 'Buffer'
+                peer.params['print'] = print
+
+                thread_ready = Future()
+                def loop_init():
+                    plugin_loop = asyncio.new_event_loop()
+                    peer.params['getRemote'] = lambda api, pluginId: PluginRemote(
+                        api, pluginId, plugin_loop)
+                    peers[pluginId] = (peer, plugin_loop)
+                    thread_ready.set_result(None)
+                    plugin_loop.run_forever()
+
+                threading.Thread(target=loop_init).start()
+                await thread_ready
+                print('started', pluginId)
+            else:
+                message = message.get('message')
+                (peer, plugin_loop) = peers.get(pluginId, None)
+                if peer:
+                    asyncio.run_coroutine_threadsafe(peer.handleMessage(message), plugin_loop)
+        except Exception as e:
+            print('read loop error', e)
+            sys.exit()
+
+
+
+def shared_main():
+    loop = asyncio.get_event_loop()
+
+    def gc_runner():
+        gc.collect()
+        loop.call_later(10, gc_runner)
+    gc_runner()
+
+    loop.run_until_complete(async_shared_main(loop))
+    loop.close()
 
 if __name__ == "__main__":
-    main()
+    if sys.argv[1] == '@scrypted/shared':
+        shared_main()
+    else:
+        main()
