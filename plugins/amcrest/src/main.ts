@@ -252,8 +252,12 @@ class AmcrestCamera extends RtspSmartCamera implements VideoCameraConfiguration,
 
             try {
                 while (true) {
-                    const data = await readLength(socket, 1024);
-                    passthrough.push(data);
+                    const header = await readLength(socket, 6);
+                    const frameLength = (header[4] << 3) | (header[5] >> 5);
+                    this.console.log('data size', frameLength);
+                    const toRead = frameLength - header.length;
+                    const payload = await readLength(socket, toRead);
+                    passthrough.push(Buffer.concat([header, payload]));
                 }
             }
             catch (e) {
