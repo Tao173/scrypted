@@ -246,10 +246,15 @@ class AmcrestCamera extends RtspSmartCamera implements VideoCameraConfiguration,
                 url,
                 headers: {
                     'Content-Type': 'multipart/x-mixed-replace;boundary=ADTSCHUNK',
+                    'Connection': 'close',
                 },
                 httpsAgent: amcrestHttpsAgent,
                 data: passthrough,
-            });
+            })
+                .catch(e => {
+                    this.console.error('amcrest 2 way audio request ended', e);
+                    socket.destroy();
+                });
 
             try {
                 while (true) {
@@ -266,6 +271,7 @@ class AmcrestCamera extends RtspSmartCamera implements VideoCameraConfiguration,
                 this.console.error('audio finished with error', e);
             }
             finally {
+                passthrough.push(Buffer.from('--ADTSCHUNK--'));
                 passthrough.end();
             }
 
