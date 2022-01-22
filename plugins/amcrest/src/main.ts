@@ -233,7 +233,7 @@ class AmcrestCamera extends RtspSmartCamera implements VideoCameraConfiguration,
         const server = new net.Server(async (socket) => {
             server.close();
 
-            const url = `http://${this.getHttpAddress()}/cgi-bin/audio.cgi?action=postAudio&httptype=singlepart&channel=${channel}`;
+            const url = `http://${this.getHttpAddress()}/cgi-bin/audio.cgi?action=postAudio&httptype=multipart&channel=${channel}`;
             this.console.log('posting audio data to', url);
 
             // seems the dahua doorbells preferred 1024 chunks. should investigate adts
@@ -243,8 +243,7 @@ class AmcrestCamera extends RtspSmartCamera implements VideoCameraConfiguration,
                 method: 'POST',
                 url,
                 headers: {
-                    'Content-Type': 'Audio/AAC',
-                    'Content-Length': '9999999'
+                    'Content-Type': 'multipart/x-mixed-replace;boundary=ADTSCHUNK',
                 },
                 httpsAgent: amcrestHttpsAgent,
                 data: passthrough,
@@ -254,10 +253,11 @@ class AmcrestCamera extends RtspSmartCamera implements VideoCameraConfiguration,
                 while (true) {
                     const header = await readLength(socket, 6);
                     const frameLength = (header[4] << 3) | (header[5] >> 5);
-                    this.console.log('data size', frameLength);
                     const toRead = frameLength - header.length;
                     const payload = await readLength(socket, toRead);
-                    passthrough.push(Buffer.concat([header, payload]));
+                    const data = Buffer.concat([header, payload]);
+                    const mpart = `--ADTSCHUNK\r\nContent-Type: Audio/AAC\r\nContent-Length: ${data.length}\r\n\r\n`
+                    passthrough.push(Buffer.concat([Buffer.from(mpart), data]));
                 }
             }
             catch (e) {
@@ -267,7 +267,8 @@ class AmcrestCamera extends RtspSmartCamera implements VideoCameraConfiguration,
                 passthrough.end();
             }
 
-            this.cp.kill();
+            this.cp?.kill();
+            this.cp = undefined;
         });
         const port = await listenZero(server)
 
