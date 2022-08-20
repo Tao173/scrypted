@@ -12,6 +12,7 @@ import { DataChannelDebouncer } from './datachannel-debouncer';
 import { createRTCPeerConnectionSink } from "./ffmpeg-to-wrtc";
 import { stunIceServers } from './ice-servers';
 import { waitClosed, waitConnected } from './peerconnection-util';
+import { RTCBridge } from './rtc-bridge';
 import { WebRTCCamera } from "./webrtc-camera";
 import { WeriftSignalingSession } from './werift-signaling-session';
 import { createRTCPeerConnectionSource, getRTCMediaStreamOptions } from './wrtc-to-rtsp';
@@ -24,10 +25,22 @@ defaultPeerConfig.headerExtensions = {
     audio: [],
 };
 
+const RTC_BRIDGE_NATIVE_ID = 'rtc-bridge';
+
 const supportedTypes = [
     ScryptedDeviceType.Camera,
     ScryptedDeviceType.Doorbell,
 ];
+
+mediaManager.addConverter({
+    fromMimeType: ScryptedMimeTypes.ScryptedDevice,
+    toMimeType: ScryptedMimeTypes.RequestMediaStream,
+    async convert(data, fromMimeType, toMimeType, options) {
+        const device = data as VideoCamera;
+        const requestMediaStream: RequestMediaStream = async options => device.getVideoStream(options);
+        return requestMediaStream;
+    }
+});
 
 class WebRTCMixin extends SettingsMixinDeviceBase<VideoCamera & RTCSignalingChannel & Intercom> implements RTCSignalingChannel, VideoCamera, Intercom {
     storageSettings = new StorageSettings(this, {});
@@ -138,6 +151,16 @@ export class WebRTCPlugin extends AutoenableMixinProvider implements DeviceCreat
 
         this.fromMimeType = '*/*';
         this.toMimeType = ScryptedMimeTypes.RTCSignalingChannel;
+
+        deviceManager.onDeviceDiscovered({
+            name: 'RTC Connection Bridge',
+            type: ScryptedDeviceType.API,
+            nativeId: RTC_BRIDGE_NATIVE_ID,
+            interfaces: [
+                ScryptedInterface.BufferConverter,
+            ],
+            internal: true,
+        });
     }
 
     getSettings(): Promise<Setting[]> {
@@ -265,6 +288,8 @@ export class WebRTCPlugin extends AutoenableMixinProvider implements DeviceCreat
     }
 
     getDevice(nativeId: string) {
+        if (nativeId === RTC_BRIDGE_NATIVE_ID)
+            return new RTCBridge(this, RTC_BRIDGE_NATIVE_ID);
         return new WebRTCCamera(this, nativeId);
     }
 
@@ -347,4 +372,4 @@ export class WebRTCPlugin extends AutoenableMixinProvider implements DeviceCreat
     }
 }
 
-export default new WebRTCPlugin();
+export default WebRTCPlugin;
